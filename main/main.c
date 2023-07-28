@@ -9,6 +9,14 @@
 // native Badge apps on.
 
 #include "main.h"
+#include "esp_now.h"
+#include "string.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include <driver/i2c.h>
+
+#define FIREFLY_BTN_PIN 0
+#define FIREFLY_LED_PIN 1
 
 static pax_buf_t buf;
 xQueueHandle buttonQueue;
@@ -27,9 +35,190 @@ void exit_to_launcher() {
     esp_restart();
 }
 
-void app_main() {
-  
+// Minimum LED on time.
+#define LED_ON_DURATION_MIN 1000
+// Maximum LED on time.
+#define LED_ON_DURATION_MAX 1250
+// Maximum LED on time drift.
+#define LED_ON_DURATION_DRIFT 50
+
+// Minimum LED off time.
+#define LED_OFF_DURATION_MIN 1500
+// Maximum LED off time.
+#define LED_OFF_DURATION_MAX 5000
+// Maximum LED off time drift.
+#define LED_OFF_DURATION_DRIFT 100
+
+// Synchronisation error time.
+#define LED_SYNC_ERROR_MIN 100
+// Synchronisation error time.
+#define LED_SYNC_ERROR_MAX 250
+
+// Probability of hearing packet in perect.
+#define PACKET_HEARD_PERCENT 70
+
+// Current LED state.
+volatile bool led_state = false;
+// Current LED on time setting.
+volatile int64_t led_on_duration;
+// Current LED off time setting.
+volatile int64_t led_off_duration;
+// Start of the last blink time.
+volatile int64_t last_blink_time;
+
+// The LED TIME MUTEX.
+SemaphoreHandle_t mtx;
+
+// LEDs turning ON flag.
+#define PACKET_FLAG_LED_ON  0x00000001
+// LEDs turning OFF flag.
+#define PACKET_FLAG_LED_OFF 0x00000002
+
+#define I2C_WRITE_ADDR(x) ((x) << 1)
+#define I2C_READ_ADDR(x) (((x) << 1) | 1)
+
+typedef enum {
+    SCREEN_SELECT,
+    SCREEN_PROGRAM,
+    SCREEN_VIRTUAL,
+    SCREEN_REAL,
+} screen_t;
+
+static uint8_t const broadcast_mac[] = {0xff,0xff,0xff,0xff,0xff,0xff};
+static uint8_t const packet_magic[] = "SAO.Firefly";
+typedef struct {
+    uint8_t magic[sizeof(packet_magic)];
+    uint32_t flags;
+    uint32_t total_duration;
+} packet_t;
+
+bool firefly_detect() {
+    static uint8_t rxbuf[4096];
     
+    // Dump the EEPROM.
+    uint8_t txbuf[2] = {0, 0};
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, I2C_WRITE_ADDR(0x50), false);
+    i2c_master_write_byte(cmd, 0, false);
+    i2c_master_write_byte(cmd, 0, false);
+    i2c_master_start(cmd);
+    i2c_master_read(cmd, rxbuf, sizeof(rxbuf), I2C_MASTER_ACK);
+    i2c_master_stop(cmd);
+    
+    
+}
+
+void espnow_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
+    int64_t now = esp_timer_get_time() / 1000;
+    
+    if (data_len < sizeof(packet_t)) {
+        // Too short; ignore this packet.
+        return;
+    }
+    packet_t packet = *(packet_t const *) data;
+    if (memcmp(packet.magic, packet_magic, sizeof(packet_magic))) {
+        // Invalid magic; ignore this packet.
+        return;
+    }
+    
+    if (esp_random() % 100 >= PACKET_HEARD_PERCENT) {
+        // Randomly throw out packet.
+        return;
+    }
+    
+    xSemaphoreTake(mtx, portMAX_DELAY);
+    uint32_t total_duration = led_on_duration + led_off_duration;
+    if (total_duration < packet.total_duration) {
+        // We're too fase; increase cycle time.
+        led_off_duration += (int) (esp_random() % LED_ON_DURATION_DRIFT) - LED_ON_DURATION_DRIFT / 4;
+        if (led_off_duration > LED_OFF_DURATION_MAX) led_off_duration = LED_OFF_DURATION_MAX;
+    } else if (total_duration > packet.total_duration) {
+        // We're too slow; decrease cycle time.
+        led_off_duration -= (int) (esp_random() % LED_ON_DURATION_DRIFT) - LED_ON_DURATION_DRIFT / 4;
+        if (led_off_duration < LED_OFF_DURATION_MIN) led_off_duration = LED_OFF_DURATION_MIN;
+    }
+    
+    if (packet.flags & PACKET_FLAG_LED_ON) {
+        // LED turned on.
+        ESP_LOGI("espnow", "Recv ON  packet");
+        if (now - last_blink_time < led_on_duration + LED_OFF_DURATION_MIN) {
+            // Cannot blink right now.
+        } else if (!led_state && now > last_blink_time + led_on_duration + LED_OFF_DURATION_MIN) {
+            // Acceptable timing; turns ON.
+            last_blink_time = now + (int) (esp_random() % (LED_SYNC_ERROR_MAX - LED_SYNC_ERROR_MIN)) + LED_SYNC_ERROR_MIN;
+        }
+    }
+    xSemaphoreGive(mtx);
+}
+
+void espnow_send_off() {
+    packet_t packet;
+    memcpy(packet.magic, packet_magic, sizeof(packet_magic));
+    packet.flags = PACKET_FLAG_LED_OFF;
+    packet.total_duration = led_on_duration + led_off_duration;
+    esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
+    ESP_LOGI("espnow", "Send OFF packet");
+}
+
+void espnow_send_on() {
+    packet_t packet;
+    memcpy(packet.magic, packet_magic, sizeof(packet_magic));
+    packet.flags = PACKET_FLAG_LED_ON;
+    packet.total_duration = led_on_duration + led_off_duration;
+    esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
+    ESP_LOGI("espnow", "Send ON  packet");
+}
+
+void espnow_init() {
+    // Initialise WiFi AP.
+    wifi_config_t wifi_config = {0};
+    wifi_config.ap.authmode       = WIFI_AUTH_OPEN;
+    wifi_config.ap.channel        = 1;
+    strcpy((char *) wifi_config.ap.ssid, "Firefly");
+    wifi_config.ap.ssid_len       = 0;
+    wifi_config.ap.ssid_hidden    = 1;
+    wifi_config.ap.max_connection = 1;
+    
+    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    esp_wifi_start();
+    
+    // Initialise the API.
+    esp_now_init();
+    // Register callback for incoming data.
+    esp_now_register_recv_cb(espnow_recv);
+    
+    // Add the broadcast peer.
+    esp_now_peer_info_t peer = {
+        .channel = 0,
+        .encrypt = false,
+        .ifidx   = WIFI_IF_AP,
+    };
+    memcpy(peer.peer_addr, broadcast_mac, sizeof(broadcast_mac));
+    esp_now_add_peer(&peer);
+}
+
+void randomise_times() {
+    led_on_duration += (int) (esp_random() % LED_ON_DURATION_DRIFT) - LED_ON_DURATION_DRIFT / 2;
+    if (led_on_duration < LED_ON_DURATION_MIN) led_on_duration = LED_ON_DURATION_MIN;
+    if (led_on_duration > LED_ON_DURATION_MAX) led_on_duration = LED_ON_DURATION_MAX;
+    
+    led_off_duration += (int) (esp_random() % LED_OFF_DURATION_DRIFT) - LED_OFF_DURATION_DRIFT / 2;
+    if (led_off_duration < LED_OFF_DURATION_MIN) led_off_duration = LED_OFF_DURATION_MIN;
+    if (led_off_duration > LED_OFF_DURATION_MAX) led_off_duration = LED_OFF_DURATION_MAX;
+}
+
+void draw_debug() {
+    // Debug information.
+    pax_col_t col = led_state ? 0xffff0000 : 0xff3f0000;
+    pax_draw_rect(&buf, col, 5, 5, 20, 20);
+    char txtbuf[256];
+    snprintf(txtbuf, sizeof(txtbuf)-1, "On:  %4llu\nOff: %4llu\nTot: %4llu", led_on_duration, led_off_duration, led_on_duration + led_off_duration);
+    pax_draw_text(&buf, 0xffffffff, pax_font_sky_mono, 9, 30, 5, txtbuf);
+}
+
+void app_main() {
     ESP_LOGI(TAG, "Welcome to the template app!");
 
     // Initialize the screen, the I2C and the SPI busses.
@@ -44,58 +233,47 @@ void app_main() {
     // Initialize graphics for the screen.
     pax_buf_init(&buf, NULL, 320, 240, PAX_BUF_16_565RGB);
     
-    // Initialize NVS.
-    nvs_flash_init();
+    // Init butterfly pins.
+    rp2040_set_gpio_dir(get_rp2040(), FIREFLY_LED_PIN, true);
     
-    // Initialize WiFi. This doesn't connect to Wifi yet.
+    // Initial randomisation.
+    led_on_duration  = esp_random() % (LED_ON_DURATION_MAX  - LED_ON_DURATION_MIN)  + LED_ON_DURATION_MIN;
+    led_off_duration = esp_random() % (LED_OFF_DURATION_MAX - LED_OFF_DURATION_MIN) + LED_OFF_DURATION_MIN;
+    
+    // Init mutex.
+    mtx = xSemaphoreCreateMutex();
+    
+    // Init networking.
+    nvs_flash_init();
     wifi_init();
+    espnow_init();
     
     while (1) {
-        // Pick a random background color.
-        int hue = esp_random() & 255;
-        pax_col_t col = pax_col_hsv(hue, 255 /*saturation*/, 255 /*brighness*/);
+        int64_t now = esp_timer_get_time() / 1000;
         
-        // Greet the World in front of a random background color! 
-        // Fill the background with the random color.
-        pax_background(&buf, col);
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        if (now > last_blink_time + led_on_duration && led_state) {
+            // Turn OFF LED.
+            led_state = false;
+            rp2040_set_gpio_value(get_rp2040(), 1, true);
+            espnow_send_off();
+        } else if (now >= last_blink_time && (now < last_blink_time + led_on_duration || now > last_blink_time + led_on_duration + led_off_duration) && !led_state) {
+            // Turn ON LED.
+            led_state = true;
+            last_blink_time = now;
+            rp2040_set_gpio_value(get_rp2040(), 1, false);
+            espnow_send_on();
+            randomise_times();
+        }
+        xSemaphoreGive(mtx);
         
-        // This text is shown on screen.
-        char             *text = "Hello, MCH2022!";
-        
-        // Pick the font (Saira is the only one that looks nice in this size).
-        const pax_font_t *font = pax_font_saira_condensed;
-
-        // Determine how the text dimensions so we can display it centered on
-        // screen.
-        pax_vec1_t        dims = pax_text_size(font, font->default_size, text);
-
-        // Draw the centered text.
-        pax_draw_text(
-            &buf, // Buffer to draw to.
-            0xff000000, // color
-            font, font->default_size, // Font and size to use.
-            // Position (top left corner) of the app.
-            (buf.width  - dims.x) / 2.0,
-            (buf.height - dims.y) / 2.0,
-            // The text to be rendered.
-            text
-        );
-
-        // Draws the entire graphics buffer to the screen.
-        disp_flush();
-        
-        // Wait for button presses and do another cycle.
-        
-        // Structure used to receive data.
+        // Check for button press.
         rp2040_input_message_t message;
-        
-        // Wait forever for a button press (because of portMAX_DELAY)
-        xQueueReceive(buttonQueue, &message, portMAX_DELAY);
-        
-        // Which button is currently pressed?
-        if (message.input == RP2040_INPUT_BUTTON_HOME && message.state) {
-            // If home is pressed, exit to launcher.
-            exit_to_launcher();
+        if (xQueueReceive(buttonQueue, &message, 1) && message.state) {
+            if (message.input == RP2040_INPUT_BUTTON_HOME) {
+                // If home is pressed, exit to launcher.
+                exit_to_launcher();
+            }
         }
     }
 }
