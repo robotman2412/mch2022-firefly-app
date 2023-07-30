@@ -1,0 +1,66 @@
+Name: "Firefly friend"
+#name: 14
+#drivers: 3
+
+Driver 0:
+    Name: "storage"
+    #name: 7
+    Fields:
+        uint8_t flags         = 0
+        uint8_t address       = 0x50
+        uint8_t size_exp      = 14 /* 16 KiB */
+        uint8_t page_size_exp = 6 /* 64 bytes */
+        uint8_t data_offset   = 1 /* TODO */
+        uint8_t reserved      = 0
+    #data: 6 bytes
+    Data: 0x00 0x50 0x0e 0x06 0x01 0x00
+
+Driver 1:
+    Name: "firefly"
+    #name: 7
+    Fields:
+        uint8_t batch_no     = 1 /* Production batch in total */
+        uint8_t hardware_ver = 1 /* Hardware revision */
+        uint8_t serial_no_lo = ? /* Serial No. shown on package */
+        uint8_t serial_no_hi = ? /* Serial No. shown on package */
+    #data: 4 bytes
+    Data: 0x01 0x01 ???? ????
+
+Driver 2:
+    Name: "app"
+    #data: 8
+    Data: 0x66 0x69 0x72 0x65 0x66 0x6c 0x79 0x00
+        /* App name: "firefly" */
+
+
+Binary data: 61 bytes
+    Header: 8 bytes
+        0x4c 0x49 0x46 0x45 /* Magic: "LIFE" */
+        0x0e /* Name length (14) */
+        0x07 /* Driver name length (7) */
+        0x06 /* Driver data length (6) */
+        0x02 /* Number of extra drivers */
+    Name: 14 bytes
+        0x46 0x69 0x72 0x65 0x66 0x6c 0x79 0x20 0x66 0x72 0x69 0x65 0x6e 0x64
+            /* Name: "Firefly friend" */
+    Driver 0: 13 bytes
+        Name: 0x73 0x74 0x6f 0x72 0x61 0x67 0x65
+            /* Driver name: "storage" */
+        Data: 0x00 0x50 0x0e 0x06 0x01 0x00
+            /* Driver data */
+    Driver 1: 13 bytes
+        Header:
+            0x03 /* Name length (3) */
+            0x08 /* Data length (8) */
+        Name: 0x61 0x70 0x70
+            /* Driver name: "app" */
+        Data: 0x66 0x69 0x72 0x65 0x66 0x6c 0x79 0x00
+            /* Driver data: "firefly\0" */
+    Driver 2: 13 bytes
+        Header:
+            0x07 /* Name length (7) */
+            0x04 /* Data length (4) */
+        Name: 0x66 0x69 0x72 0x65 0x66 0x6c 0x79
+            /* Driver name: "firefly" */
+        Data: 0x01 0x01 ???? ????
+            /* Driver data */
