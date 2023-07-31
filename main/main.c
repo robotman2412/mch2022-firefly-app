@@ -14,6 +14,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include <driver/i2c.h>
+#include "sao_eeprom.h"
+#include "pax_codecs.h"
+
+extern uint8_t firefly_qr_start[] asm("_binary_firefly_qr_png_start");
+extern uint8_t firefly_qr_end[]   asm("_binary_firefly_qr_png_end");
+
+int menu_pos = 1;
+#define MENU_NUM 3
 
 #define FIREFLY_BTN_PIN 0
 #define FIREFLY_LED_PIN 1
@@ -34,6 +42,9 @@ void exit_to_launcher() {
     REG_WRITE(RTC_CNTL_STORE0_REG, 0);
     esp_restart();
 }
+
+// Time between SAO detecting moments.
+#define SAO_DETECT_INTERVAL 1000
 
 // Minimum LED on time.
 #define LED_ON_DURATION_MIN 1000
@@ -57,6 +68,12 @@ void exit_to_launcher() {
 // Probability of hearing packet in perect.
 #define PACKET_HEARD_PERCENT 70
 
+// Last SAO detection time.
+int64_t sao_detect_time = 0;
+// Is there a firefly SAO?
+bool sao_detected = false;
+// Is the blinking enabled?
+bool blink_enable = false;
 // Current LED state.
 volatile bool led_state = false;
 // Current LED on time setting.
@@ -65,6 +82,8 @@ volatile int64_t led_on_duration;
 volatile int64_t led_off_duration;
 // Start of the last blink time.
 volatile int64_t last_blink_time;
+// Random ID decided at startup.
+uint32_t randid;
 
 // The LED TIME MUTEX.
 SemaphoreHandle_t mtx;
@@ -74,39 +93,28 @@ SemaphoreHandle_t mtx;
 // LEDs turning OFF flag.
 #define PACKET_FLAG_LED_OFF 0x00000002
 
-#define I2C_WRITE_ADDR(x) ((x) << 1)
-#define I2C_READ_ADDR(x) (((x) << 1) | 1)
-
-typedef enum {
-    SCREEN_SELECT,
-    SCREEN_PROGRAM,
-    SCREEN_VIRTUAL,
-    SCREEN_REAL,
-} screen_t;
-
 static uint8_t const broadcast_mac[] = {0xff,0xff,0xff,0xff,0xff,0xff};
 static uint8_t const packet_magic[] = "SAO.Firefly";
 typedef struct {
     uint8_t magic[sizeof(packet_magic)];
     uint32_t flags;
     uint32_t total_duration;
+    uint32_t randid;
 } packet_t;
 
+SAO sao;
+sao_driver_firefly_data_t firefly_data;
+
 bool firefly_detect() {
-    static uint8_t rxbuf[4096];
-    
-    // Dump the EEPROM.
-    uint8_t txbuf[2] = {0, 0};
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, I2C_WRITE_ADDR(0x50), false);
-    i2c_master_write_byte(cmd, 0, false);
-    i2c_master_write_byte(cmd, 0, false);
-    i2c_master_start(cmd);
-    i2c_master_read(cmd, rxbuf, sizeof(rxbuf), I2C_MASTER_ACK);
-    i2c_master_stop(cmd);
-    
-    
+    if (!sao_identify(&sao)) {
+        for (size_t i = 0; i < sao.amount_of_drivers; i++) {
+            if (!strcmp(sao.drivers[i].name, SAO_DRIVER_FIREFLY_NAME)) {
+                firefly_data = sao.drivers[i].firefly;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void espnow_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
@@ -141,7 +149,7 @@ void espnow_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
     
     if (packet.flags & PACKET_FLAG_LED_ON) {
         // LED turned on.
-        ESP_LOGI("espnow", "Recv ON  packet");
+        ESP_LOGD("espnow", "Recv ON  packet");
         if (now - last_blink_time < led_on_duration + LED_OFF_DURATION_MIN) {
             // Cannot blink right now.
         } else if (!led_state && now > last_blink_time + led_on_duration + LED_OFF_DURATION_MIN) {
@@ -157,8 +165,9 @@ void espnow_send_off() {
     memcpy(packet.magic, packet_magic, sizeof(packet_magic));
     packet.flags = PACKET_FLAG_LED_OFF;
     packet.total_duration = led_on_duration + led_off_duration;
+    packet.randid = randid;
     esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
-    ESP_LOGI("espnow", "Send OFF packet");
+    ESP_LOGD("espnow", "Send OFF packet");
 }
 
 void espnow_send_on() {
@@ -166,8 +175,9 @@ void espnow_send_on() {
     memcpy(packet.magic, packet_magic, sizeof(packet_magic));
     packet.flags = PACKET_FLAG_LED_ON;
     packet.total_duration = led_on_duration + led_off_duration;
+    packet.randid = randid;
     esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
-    ESP_LOGI("espnow", "Send ON  packet");
+    ESP_LOGD("espnow", "Send ON  packet");
 }
 
 void espnow_init() {
@@ -218,6 +228,26 @@ void draw_debug() {
     pax_draw_text(&buf, 0xffffffff, pax_font_sky_mono, 9, 30, 5, txtbuf);
 }
 
+void draw_ui() {
+    pax_background(&buf, 0);
+    
+    if (!blink_enable && !sao_detected) {
+        // Show an INFO.
+        pax_insert_png_buf(&buf, firefly_qr_start, firefly_qr_end-firefly_qr_start, 104, 64, 0);
+        pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 10, "Firefly not detected!");
+        pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 28, "Scan the QR for more info:");
+        pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 194, "If you want to proceed anyway,");
+        pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 212, "Press the 🅰 button.");
+        
+    } else {
+        if (!sao_detected) {
+            pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 10, "Firefly not detected!");
+        }
+    }
+    
+    disp_flush();
+}
+
 void app_main() {
     ESP_LOGI(TAG, "Welcome to the template app!");
 
@@ -244,6 +274,7 @@ void app_main() {
     mtx = xSemaphoreCreateMutex();
     
     // Init networking.
+    randid = esp_random();
     nvs_flash_init();
     wifi_init();
     espnow_init();
@@ -251,21 +282,43 @@ void app_main() {
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;
         
-        xSemaphoreTake(mtx, portMAX_DELAY);
-        if (now > last_blink_time + led_on_duration && led_state) {
-            // Turn OFF LED.
-            led_state = false;
-            rp2040_set_gpio_value(get_rp2040(), 1, true);
-            espnow_send_off();
-        } else if (now >= last_blink_time && (now < last_blink_time + led_on_duration || now > last_blink_time + led_on_duration + led_off_duration) && !led_state) {
-            // Turn ON LED.
-            led_state = true;
-            last_blink_time = now;
-            rp2040_set_gpio_value(get_rp2040(), 1, false);
-            espnow_send_on();
-            randomise_times();
+        if (now > sao_detect_time + SAO_DETECT_INTERVAL) {
+            bool det = firefly_detect();
+            if (!det && sao_detected) {
+                ESP_LOGI("firefly", "SAO firefly disconnected");
+                blink_enable = false;
+                draw_ui();
+            } else if (det && !sao_detected) {
+                ESP_LOGI("firefly", "SAO firefly detected:");
+                ESP_LOGI("firefly", "    Batch:  %d", firefly_data.batch_no);
+                ESP_LOGI("firefly", "    Rev.:   %d", firefly_data.hardware_ver);
+                ESP_LOGI("firefly", "    Serial: %d", firefly_data.serial_no_lo + firefly_data.serial_no_hi * 256);
+                blink_enable = true;
+                draw_ui();
+            } else if (sao_detect_time == 0) {
+                draw_ui();
+            }
+            sao_detected = det;
+            sao_detect_time = now;
         }
-        xSemaphoreGive(mtx);
+        
+        if (blink_enable) {
+            xSemaphoreTake(mtx, portMAX_DELAY);
+            if (now > last_blink_time + led_on_duration && led_state) {
+                // Turn OFF LED.
+                led_state = false;
+                rp2040_set_gpio_value(get_rp2040(), 1, true);
+                espnow_send_off();
+            } else if (now >= last_blink_time && (now < last_blink_time + led_on_duration || now > last_blink_time + led_on_duration + led_off_duration) && !led_state) {
+                // Turn ON LED.
+                led_state = true;
+                last_blink_time = now;
+                rp2040_set_gpio_value(get_rp2040(), 1, false);
+                espnow_send_on();
+                randomise_times();
+            }
+            xSemaphoreGive(mtx);
+        }
         
         // Check for button press.
         rp2040_input_message_t message;
@@ -273,6 +326,12 @@ void app_main() {
             if (message.input == RP2040_INPUT_BUTTON_HOME) {
                 // If home is pressed, exit to launcher.
                 exit_to_launcher();
+            } else if (message.input == RP2040_INPUT_BUTTON_ACCEPT) {
+                // Enable the blinking.
+                blink_enable = true;
+            } else if (message.input == RP2040_INPUT_BUTTON_BACK) {
+                // Disable the blinking if there is no SAO detected.
+                blink_enable = sao_detected;
             }
         }
     }

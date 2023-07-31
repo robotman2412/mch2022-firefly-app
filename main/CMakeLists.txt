@@ -6,6 +6,9 @@
 idf_component_register(
     SRCS
         "main.c"
+        "sao_eeprom.c"
     INCLUDE_DIRS
         "." "include"
+    EMBED_FILES
+        "firefly_qr.png"
 )

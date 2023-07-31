@@ -43,3 +43,6 @@
 [submodule "tools"]
 	path = tools
 	url = https://github.com/badgeteam/mch2022-tools
+[submodule "components/eeprom"]
+	path = components/eeprom
+	url = https://github.com/Nicolai-Electronics/esp32-component-i2c-eeprom.git
