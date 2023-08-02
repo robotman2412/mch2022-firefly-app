@@ -84,14 +84,27 @@ volatile int64_t led_off_duration;
 volatile int64_t last_blink_time;
 // Random ID decided at startup.
 uint32_t randid;
+// Number of detected fireflies.
+size_t firefly_count;
 
 // The LED TIME MUTEX.
 SemaphoreHandle_t mtx;
 
+// Amount of IDs to keep track of at most.
+#define ID_TABLE_LEN        1337
+// Maximum age of IDs in milliseconds.
+#define ID_TIMEOUT          6000
 // LEDs turning ON flag.
 #define PACKET_FLAG_LED_ON  0x00000001
 // LEDs turning OFF flag.
 #define PACKET_FLAG_LED_OFF 0x00000002
+// Firefly detected flag.
+#define PACKET_FLAG_SAO     0x00000004
+
+// Randid buffer.
+uint32_t id_table[ID_TABLE_LEN];
+// Randid recv timestamp.
+int64_t  id_time_table[ID_TABLE_LEN];
 
 static uint8_t const broadcast_mac[] = {0xff,0xff,0xff,0xff,0xff,0xff};
 static uint8_t const packet_magic[] = "SAO.Firefly";
@@ -147,6 +160,23 @@ void espnow_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
         if (led_off_duration < LED_OFF_DURATION_MIN) led_off_duration = LED_OFF_DURATION_MIN;
     }
     
+    bool has_update = false;
+    for (size_t i = 0; i < ID_TABLE_LEN; i++) {
+        if (id_table[i] == packet.randid) {
+            id_time_table[i] = now;
+            has_update = true;
+        }
+    }
+    if (!has_update) {
+        for (size_t i = 0; i < ID_TABLE_LEN; i++) {
+            if (now > id_time_table[i] + ID_TIMEOUT) {
+                id_table[i] = packet.randid;
+                id_time_table[i] = now;
+                break;
+            }
+        }
+    }
+    
     if (packet.flags & PACKET_FLAG_LED_ON) {
         // LED turned on.
         ESP_LOGD("espnow", "Recv ON  packet");
@@ -163,7 +193,7 @@ void espnow_recv(const uint8_t *mac_addr, const uint8_t *data, int data_len) {
 void espnow_send_off() {
     packet_t packet;
     memcpy(packet.magic, packet_magic, sizeof(packet_magic));
-    packet.flags = PACKET_FLAG_LED_OFF;
+    packet.flags = PACKET_FLAG_LED_OFF | PACKET_FLAG_SAO * sao_detected;
     packet.total_duration = led_on_duration + led_off_duration;
     packet.randid = randid;
     esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
@@ -173,7 +203,7 @@ void espnow_send_off() {
 void espnow_send_on() {
     packet_t packet;
     memcpy(packet.magic, packet_magic, sizeof(packet_magic));
-    packet.flags = PACKET_FLAG_LED_ON;
+    packet.flags = PACKET_FLAG_LED_ON | PACKET_FLAG_SAO * sao_detected;
     packet.total_duration = led_on_duration + led_off_duration;
     packet.randid = randid;
     esp_now_send(broadcast_mac, (void const *) &packet, sizeof(packet));
@@ -243,6 +273,9 @@ void draw_ui() {
         if (!sao_detected) {
             pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 10, "Firefly not detected!");
         }
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp)-1, "%d %s nearby.", firefly_count, firefly_count == 1 ? "firefly" : "fireflies");
+        pax_center_text(&buf, 0xffffffff, pax_font_saira_regular, 18, 160, 212, tmp);
     }
     
     disp_flush();
@@ -272,6 +305,9 @@ void app_main() {
     
     // Init mutex.
     mtx = xSemaphoreCreateMutex();
+    for (size_t i = 0; i < ID_TABLE_LEN; i++) {
+        id_time_table[i] = 0;
+    }
     
     // Init networking.
     randid = esp_random();
@@ -283,12 +319,13 @@ void app_main() {
         int64_t now = esp_timer_get_time() / 1000;
         
         if (now > sao_detect_time + SAO_DETECT_INTERVAL) {
-            bool det = firefly_detect();
-            if (!det && sao_detected) {
+            bool pdet = sao_detected;
+            sao_detected = firefly_detect();
+            if (pdet && !sao_detected) {
                 ESP_LOGI("firefly", "SAO firefly disconnected");
                 blink_enable = false;
                 draw_ui();
-            } else if (det && !sao_detected) {
+            } else if (pdet && sao_detected) {
                 ESP_LOGI("firefly", "SAO firefly detected:");
                 ESP_LOGI("firefly", "    Batch:  %d", firefly_data.batch_no);
                 ESP_LOGI("firefly", "    Rev.:   %d", firefly_data.hardware_ver);
@@ -298,12 +335,22 @@ void app_main() {
             } else if (sao_detect_time == 0) {
                 draw_ui();
             }
-            sao_detected = det;
             sao_detect_time = now;
         }
         
         if (blink_enable) {
             xSemaphoreTake(mtx, portMAX_DELAY);
+            size_t on = 0;
+            for (size_t i = 0; i < ID_TABLE_LEN; i++) {
+                if (id_time_table[i] + ID_TIMEOUT > now) {
+                    on ++;
+                }
+            }
+            if (firefly_count != on) {
+                draw_ui();
+            }
+            firefly_count = on;
+            
             if (now > last_blink_time + led_on_duration && led_state) {
                 // Turn OFF LED.
                 led_state = false;
@@ -333,6 +380,7 @@ void app_main() {
                 // Disable the blinking if there is no SAO detected.
                 blink_enable = sao_detected;
             }
+            draw_ui();
         }
     }
 }

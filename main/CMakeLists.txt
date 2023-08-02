@@ -11,4 +11,17 @@ idf_component_register(
         "." "include"
     EMBED_FILES
         "firefly_qr.png"
+    REQUIRES
+        appfs
+        bus-i2c
+        eeprom
+        mch2022-bsp
+        mch2022-rp2040
+        pax-codecs
+        pax-graphics
+        pax-keyboard
+        sdcard
+        spi-ice40
+        spi-ili9341
+        ws2812
 )
