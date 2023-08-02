@@ -306,7 +306,7 @@ void app_main() {
     // Init mutex.
     mtx = xSemaphoreCreateMutex();
     for (size_t i = 0; i < ID_TABLE_LEN; i++) {
-        id_time_table[i] = 0;
+        id_time_table[i] = -ID_TIMEOUT;
     }
     
     // Init networking.
@@ -325,7 +325,7 @@ void app_main() {
                 ESP_LOGI("firefly", "SAO firefly disconnected");
                 blink_enable = false;
                 draw_ui();
-            } else if (pdet && sao_detected) {
+            } else if (!pdet && sao_detected) {
                 ESP_LOGI("firefly", "SAO firefly detected:");
                 ESP_LOGI("firefly", "    Batch:  %d", firefly_data.batch_no);
                 ESP_LOGI("firefly", "    Rev.:   %d", firefly_data.hardware_ver);
